@@ -1,0 +1,22 @@
+[Unit]
+Description=WeChat native lab receive only
+After=docker.service
+Requires=docker.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wechat-native-lab/access
+ExecStart=/usr/bin/python3 -u -m linux_native.supervisor --config /opt/wechat-native-lab/access/receiver.json
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=15
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+MemoryMax=256M
+CPUQuota=100%
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+{
+  "api": "v1",
+  "description": "由模型判断是否回应或主动参与，支持无发送草稿模式",
+  "default_enabled": false,
+  "requires": ["group.text.receive", "group.text.send"]
+}

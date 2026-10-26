@@ -1,0 +1,19 @@
+{
+  "api": "v1",
+  "default_enabled": false,
+  "description": "按群选择 Fish Audio 或 MiniMax 音色，为聊天回复合成微信语音",
+  "message_types": [
+    1
+  ],
+  "requires": [
+    "group.text.receive",
+    "text.send",
+    "voice.send"
+  ],
+  "business": [
+    {
+      "function": "Plugin.on_message",
+      "label": "查看与切换音色"
+    }
+  ]
+}

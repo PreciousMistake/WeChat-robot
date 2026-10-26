@@ -1,0 +1,23 @@
+services:
+  wechat:
+    build: .
+    image: wechat-native-lab:20261025-r1
+    container_name: wechat-native-lab
+    labels:
+      org.weixin-helper.lab: native-validation
+    mem_limit: 2g
+    memswap_limit: 2g
+    cpus: 2.0
+    pids_limit: 512
+    shm_size: 256m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - 127.0.0.1:18086:6080
+    volumes:
+      - ./home:/home/wechat:Z
+    logging:
+      options:
+        max-size: 10m
+        max-file: "2"
+    restart: "no"

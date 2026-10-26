@@ -1,0 +1,689 @@
+"""仅监听本机的管理台；配置、密钥和原生生命周期仍由当前项目管理。"""
+from __future__ import annotations
+
+from collections import deque
+from concurrent.futures import TimeoutError as ControlTimeout
+from contextlib import contextmanager
+from copy import deepcopy
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import tempfile
+import threading
+import time
+
+from .config import ConfigStore, account_is_unbound, initialize_configs, validate_name
+from .locking import InstanceLock
+from .panel_common import PanelError as PanelError, redact as redact
+from .panel_http import PanelHandler as PanelHandler, PanelServer as PanelServer
+from .message_monitor import MessageBuffer
+from .plugin_sources import PluginSources
+from .plugin_business import view as business_view, merge as merge_business
+from .runtime import BotApplication
+from .startup import scan_logged_accounts
+from .text import validate_target, validate_mentions
+
+__all__ = ['LogBuffer', 'PanelController', 'PanelError', 'PanelHandler', 'PanelServer',
+           'atomic_json', 'read_json', 'redact']
+
+def read_json(path):
+    data = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+    if not isinstance(data, dict):
+        raise ValueError('配置必须为 JSON 对象')
+    return data
+
+
+def atomic_json(path, data):
+    path = Path(path)
+    fd, temporary = tempfile.mkstemp(prefix='.web-config-', suffix='.tmp', dir=path.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as output:
+            output.write(json.dumps(data, ensure_ascii=False, indent=2) + '\n')
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+
+
+class LogBuffer(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.rows = deque(maxlen=2000)
+        self.sequence = 0
+
+    def emit(self, record):
+        self.acquire()
+        try:
+            self.sequence += 1
+            self.rows.append({'id': self.sequence, 'time': time.strftime('%H:%M:%S', time.localtime(record.created)),
+                              'level': record.levelname, 'logger': record.name,
+                              'message': redact(self.format(record))})
+        finally:
+            self.release()
+
+    def tail(self, after=0):
+        self.acquire()
+        try:
+            return {'rows': [row for row in self.rows if row['id'] > after][-300:], 'cursor': self.sequence}
+        finally:
+            self.release()
+
+
+class PanelController:
+    def __init__(self, root, *, workspace=None, app_factory=BotApplication, scan=scan_logged_accounts, lock_factory=InstanceLock):
+        self.root = Path(root).resolve()
+        self.workspace = Path(workspace or root).resolve()
+        if self.workspace == self.root:
+            initialize_configs(self.root)
+        else:
+            self.workspace.mkdir(parents=True, exist_ok=True)
+            for stem in ('bot_config', 'members_config', 'llm_config', 'tts_config', 'asr_config', 'image_config'):
+                target = self.workspace / (stem + '.json')
+                if stem in ('asr_config','image_config') and not (self.root/(stem+'.example.json')).exists():continue
+                if not target.exists():
+                    with target.open('x', encoding='utf-8') as output:
+                        output.write((self.root / (stem + '.example.json')).read_text(encoding='utf-8-sig'))
+        self.store = ConfigStore(self.workspace / 'bot_config.json')
+        self.plugin_sources = PluginSources(self.root / 'plugins', self.workspace)
+        self.factory, self.scan, self.lock_factory = app_factory, scan, lock_factory
+        self.lock = threading.RLock()
+        self.actions = threading.Lock()
+        self.app = self.worker = None
+        self.state, self.error, self.started = 'stopped', '', None
+        self.stop_event, self.stopped_event = threading.Event(), threading.Event()
+        self.logs = LogBuffer()
+        self.messages = MessageBuffer(sanitize=redact)
+        self.send_jobs = {}
+        logging.getLogger().addHandler(self.logs)
+
+    def _paths(self, config):
+        return {name: (self.workspace / config.get(field, default)).resolve()
+                for name, field, default in [('llm', 'llm_config_file', 'llm_config.json'),
+                    ('tts', 'tts_config_file', 'tts_config.json'),
+                    ('asr', 'asr_config_file', 'asr_config.json'),
+                    ('members', 'members_config_file', 'members_config.json')]
+                if config.get(field, default) is not None and
+                   (name!='asr' or (self.workspace/config.get(field,default)).exists())}
+
+    def _idle(self):
+        if self.worker is not None and self.worker.is_alive():
+            raise PanelError('请先停止机器人，等清理完成后再保存配置', 409)
+        # 另一终端启动的 main.py 也不能被本面板修改正在使用的配置。
+        try:
+            with self.lock_factory(self.workspace / '.runtime/bot.lock'):
+                pass
+        except RuntimeError:
+            raise PanelError('此项目已在其他窗口运行，请先在原窗口输入 quit', 409) from None
+
+    @contextmanager
+    def _editing(self):
+        if self.worker is not None and self.worker.is_alive():
+            raise PanelError('请先停止机器人，等清理完成后再保存配置', 409)
+        lease = self.lock_factory(self.workspace / '.runtime/bot.lock')
+        try:
+            lease.acquire()
+        except RuntimeError:
+            raise PanelError('此项目已在其他窗口运行，请先在原窗口输入 quit', 409) from None
+        try:
+            yield
+        finally:
+            lease.close()
+
+    def accounts(self):
+        return self.scan(self.root)
+
+    def bind_account(self, data):
+        with self.actions, self.lock, self._editing():
+            wxid, pid = data.get('wxid'), data.get('pid')
+            rows = self.accounts()
+            if type(pid) is not int or not any(row['wxid'] == wxid and row['pid'] == pid for row in rows):
+                raise PanelError('账号已退出或列表已变化，请刷新后重新选择')
+            if sum(row['wxid'] == wxid for row in rows) != 1:
+                raise PanelError('该账号对应多个微信进程，请先关闭重复会话')
+            config = self.store.load()
+            changed_account = config.get('wechat_account') != wxid
+            config.update(wechat_account=wxid, wechat_pid=None)
+            self._save_many({self.store.path: config})
+            if changed_account:
+                self.messages.reset()
+
+    def start(self):
+        with self.actions, self.lock:
+            self._idle()
+            lease = self.lock_factory(self.workspace / '.runtime/bot.lock')
+            lease.acquire()
+            try:
+                config = self.store.load()
+                if account_is_unbound(config.get('wechat_account')):
+                    rows = self.accounts()
+                    if len(rows) != 1:
+                        raise PanelError('请先登录微信，在页面选择并绑定机器人账号', 409)
+                    confirmed = self.accounts()
+                    if not any(row['wxid'] == rows[0]['wxid'] and row['pid'] == rows[0]['pid'] for row in confirmed):
+                        raise PanelError('账号状态已变化，请刷新后选择账号', 409)
+                    config = self.store.bind_account(rows[0]['wxid'])
+                app = self.factory(self.root, self.store)
+                app.config['console'] = False
+                def observe(message):
+                    name = message.data.get('sender_wechat_name', '')
+                    members = getattr(app, 'members', None)
+                    if members is not None and message.is_group and message.sender_id and not message.is_self:
+                        try:
+                            name = members.display_name(message.sender_id, message.chat_id) or name
+                        except Exception:
+                            pass
+                    self.messages.append(message, account=app.config.get('wechat_account') or '', sender_name=name)
+                app.message_observer = observe
+                self.app, self.state, self.error, self.started = app, 'starting', '', time.time()
+
+                def run():
+                    try:
+                        app.run()
+                    except Exception as error:
+                        with self.lock:
+                            self.error = redact(error)
+                        logging.getLogger('WebPanel').exception('机器人运行失败')
+                    finally:
+                        try:
+                            # run() 自带 finally 清理；构造后未进入 run 的异常也不能留下连接。
+                            if not app.stopped_event.is_set():
+                                app.stop()
+                        except Exception as error:
+                            with self.lock:
+                                self.error = redact(error)
+                        finally:
+                            lease.close()
+                            with self.lock:
+                                self.state = 'error' if self.error else 'stopped'
+                                self.app = None
+
+                self.worker = threading.Thread(target=run, name='ManagedBot', daemon=False)
+                self.worker.start()
+                self.state = 'running'
+            except Exception:
+                lease.close()
+                raise
+
+    def stop(self):
+        with self.lock:
+            if self.app is not None:
+                self.state = 'stopping'
+                self.app.stop_event.set()
+
+    def restart(self):
+        with self.lock:
+            worker = self.worker
+            if worker is None or not worker.is_alive():
+                raise PanelError('机器人尚未运行，请直接启动', 409)
+        self.stop()
+        worker.join(15)
+        if worker.is_alive():
+            raise PanelError('机器人仍在清理，请等停止后再启动', 409)
+        with self.lock:
+            if self.error:
+                raise PanelError('上次退出有异常，请核对日志后再启动', 409)
+            if self.stop_event.is_set():
+                raise PanelError('管理服务正在退出', 409)
+        self.start()
+
+    def close(self):
+        self.stop_event.set()
+        self.stop()
+        if self.worker is not None:
+            self.worker.join(15)
+        logging.getLogger().removeHandler(self.logs)
+        self.stopped_event.set()
+
+    def _call(self, callback):
+        with self.lock:
+            app = self.app
+            if app is None or self.state == 'stopping':
+                raise PanelError('请先启动机器人', 409)
+            future = app.submit_control(lambda: callback(app))
+        try:
+            return future.result(timeout=15)
+        except ControlTimeout:
+            future.cancel()
+            raise PanelError('操作仍在等待微信；请查看运行状态后再试', 409) from None
+
+    def plugin_rows(self):
+        with self.lock:
+            if self.app is not None:
+                return self.app.plugins.status()
+            config = self.store.load()
+            rows = []
+            for path in sorted((self.root / 'plugins').glob('*/plugin.json')):
+                if path.parent.name.startswith('_') or not (path.parent / '__init__.py').is_file():
+                    continue
+                name = path.parent.name
+                path = self.plugin_sources.path(name) / 'plugin.json'
+                manifest = read_json(path)
+                options = config.get('plugins', {}).get(name, {})
+                rows.append({'name': name, 'description': manifest.get('description', ''),
+                    'enabled': options.get('enabled', manifest.get('default_enabled', True)),
+                    'active': False, 'handled': 0, 'errors': 0, 'error': ''})
+            return rows
+
+    def snapshot(self):
+        with self.lock:
+            config = self.store.load()
+            return {'state': self.state, 'connected': bool(self.app and self.app._connection_ready),
+                    'account': config.get('wechat_account') or '',
+                    'pid': getattr(getattr(self.app, 'backend', None), 'pid', None),
+                    'started_at': self.started, 'error': self.error,
+                    'connection_error': redact(self.app._last_connection_error) if self.app else '',
+                    'plugins': self.plugin_rows()}
+
+    def configuration(self):
+        config = self.store.load()
+        paths = self._paths(config)
+        result = {'account': config.get('wechat_account') or '',
+            'chat_allowlist': config.get('chat_allowlist', []),
+            'text_send_delay': config.get('text_send_delay', {}),
+            'plugins': config.get('plugins', {})}
+        for name, path in paths.items():
+            value = deepcopy(read_json(path))
+            if name == 'asr':
+                result[name]={key:value[key] for key in ('enabled','groups','model','websocket_url','timeout_seconds') if key in value}
+                result[name]['api_key_configured']=bool(value.get('api_key'))
+                result[name]['wechat_data_directory']=config.get('wechat_data_directory') or ''
+            elif name in ('llm', 'tts'):
+                result[name] = {key: value[key] for key in
+                    ('base_url', 'model', 'timeout_seconds', 'max_tokens', 'json_mode',
+                     'token_limit_parameter', 'extra_body', 'default_voice', 'max_chars_per_clip') if key in value}
+                if name == 'tts':
+                    result[name]['provider'] = value.get('provider', 'fish')
+                    result[name]['profiles'] = {provider: {
+                        **{key: profile[key] for key in ('base_url','model','default_voice',
+                            'timeout_seconds','max_chars_per_clip') if key in profile},
+                        'api_key_configured': bool(profile.get('api_key'))}
+                        for provider, profile in value.get('profiles', {}).items()
+                        if provider in ('fish','minimax') and isinstance(profile, dict)}
+                if name == 'llm':
+                    for key, default in (('json_mode', True), ('token_limit_parameter', 'max_tokens'), ('extra_body', {})):
+                        result[name].setdefault(key, default)
+                result[name]['api_key_configured'] = bool(value.get('api_key'))
+            else:
+                result['groups'] = list(value.get('groups', {}))
+                result['history_enabled'] = value.get('history_enabled', True)
+                result['daily_clear'] = value.get('daily_clear', True)
+        from .natural_settings import normalize_settings
+        result['natural_chat'] = normalize_settings(
+            config.get('plugins', {}).get('natural_chat', {}), result.get('groups', []),
+            self.root, prune_unknown=True)
+        from linux_native.image_client import normalize_image_config
+        path = self.workspace / 'image_config.json'
+        image = normalize_image_config(read_json(path) if path.exists() else {})
+        image['api_key_configured'] = bool(image['api_key'])
+        image.pop('api_key', None)
+        result['image'] = image
+        return result
+
+    def message_tail(self, after=0):
+        return self.messages.tail(after)
+
+    def _save_many(self, changes):
+        backup = self.workspace / '.runtime/web/backups' / str(time.time_ns())
+        backup.mkdir(parents=True)
+        originals = {path: path.read_bytes() if path.exists() else None for path in changes}
+        for index, (path, raw) in enumerate(originals.items()):
+            (backup / f'{index}-{path.name}').write_bytes(raw) if raw is not None else None
+        written = []
+        try:
+            for path, value in changes.items():
+                atomic_json(path, value)
+                written.append(path)
+        except Exception:
+            for path in reversed(written):
+                path.write_bytes(originals[path]) if originals[path] is not None else path.unlink(missing_ok=True)
+            raise
+
+    def save_configuration(self, data):
+        hot={'groups','history_enabled','daily_clear','natural_chat','asr','chat_allowlist','image'}
+        with self.actions:
+            with self.lock:
+                app=self.app
+                running=bool(self.worker and self.worker.is_alive())
+                if running and (self.state!='running' or not set(data)<=hot):
+                    raise PanelError('此设置需要停止机器人后保存；群聊、人格与识别配置可运行中更新',409)
+            if running:return self._call(lambda live:self._save_configuration(data,live))
+            return self._save_configuration(data)
+
+    @contextmanager
+    def _configuration_editing(self,app):
+        if app is None:
+            with self._editing():yield
+        elif app is not self.app or self.state!='running':
+            raise PanelError('机器人状态已变化，请刷新后重试',409)
+        else:yield
+
+    def _save_configuration(self, data, app=None):
+        with self.lock, self._configuration_editing(app):
+            config = self.store.load()
+            paths, changes = self._paths(config), {}
+            if 'image' in data:
+                from linux_native.image_client import normalize_image_config
+                edit = data['image']
+                if not isinstance(edit, dict):raise ValueError('生图配置必须为对象')
+                path = self.workspace / 'image_config.json'
+                value = read_json(path) if path.exists() else {}
+                key = edit.get('api_key', '')
+                if not isinstance(key, str):raise ValueError('生图密钥格式无效')
+                value.update({k:v for k,v in edit.items() if k not in ('api_key','clear_api_key','api_key_configured')})
+                if edit.get('clear_api_key') is True:value['api_key']=''
+                elif key.strip() and key != '********':value['api_key']=key.strip()
+                changes[path] = normalize_image_config(value)
+            if 'asr' in data:
+                edit=data['asr']
+                if 'asr' not in paths or not isinstance(edit,dict):raise PanelError('语音识别配置格式无效')
+                value=read_json(paths['asr'])
+                for key in ('enabled','groups','model','websocket_url','timeout_seconds'):
+                    if key in edit:value[key]=edit[key]
+                if type(value.get('enabled',False)) is not bool:raise PanelError('语音识别开关无效')
+                groups=value.get('groups',[])
+                if not isinstance(groups,list) or len(groups)>1000:raise PanelError('识别群应为群ID列表')
+                from .group_management import validate_group_id
+                for group in groups:validate_group_id(group)
+                value['groups']=list(dict.fromkeys(groups))
+                key=edit.get('api_key','')
+                if not isinstance(key,str) or len(key)>4096 or any(ord(c)<32 for c in key):raise PanelError('识别密钥格式无效')
+                if edit.get('clear_api_key') is True:value['api_key']=''
+                elif key.strip():value['api_key']=key.strip()
+                if 'wechat_data_directory' in edit:
+                    directory=edit['wechat_data_directory']
+                    if not isinstance(directory,str) or '\0' in directory:raise PanelError('微信数据目录无效')
+                    config['wechat_data_directory']=directory.strip() or None
+                if value.get('enabled') and (not groups or not config.get('wechat_data_directory') or not value.get('api_key')):
+                    raise PanelError('启用前请填写识别密钥、小号数据目录及识别群ID')
+                from .cloud_audio import ASRClient
+                ASRClient(**{k:v for k,v in dict(value,api_key=value.get('api_key') or 'validation-only').items()
+                            if k in ('api_key','model','websocket_url','timeout_seconds')})
+                changes[paths['asr']]=value
+            if 'chat_allowlist' in data:
+                values = data['chat_allowlist']
+                if not isinstance(values, list) or len(values) > 1000:
+                    raise PanelError('会话白名单应为列表，最多 1000 项')
+                for value in values:
+                    validate_target(value)
+                config['chat_allowlist'] = list(dict.fromkeys(values))
+            if 'text_send_delay' in data:
+                from .pacing import TextSendDelay
+                TextSendDelay.from_config(data['text_send_delay'])
+                config['text_send_delay'] = data['text_send_delay']
+            for name in ('llm', 'tts'):
+                if name not in data:
+                    continue
+                if name not in paths or not isinstance(data[name], dict):
+                    raise PanelError('模型配置格式不正确')
+                value = read_json(paths[name])
+                if name == 'tts':
+                    from .cloud_audio import select_tts_profile
+                    value = select_tts_profile(value, data[name].get('provider', value.get('provider','fish')))
+                fields = {'base_url', 'model', 'timeout_seconds'} | ({'max_tokens', 'json_mode', 'token_limit_parameter', 'extra_body'} if name == 'llm'
+                            else {'default_voice', 'max_chars_per_clip'})
+                for key in fields:
+                    if key in data[name]:
+                        value[key] = data[name][key]
+                key = data[name].get('api_key', '')
+                if not isinstance(key, str) or len(key) > 1024 or any(ord(ch) < 32 for ch in key):
+                    raise PanelError('API 密钥格式不正确')
+                if data[name].get('clear_api_key') is True:
+                    value['api_key'] = ''
+                elif key.strip():
+                    value['api_key'] = key.strip()
+                # 允许先保存未填密钥的模板，其余字段沿用真实客户端验证。
+                validation = dict(value, api_key=value.get('api_key') or 'validation-only')
+                if name == 'llm':
+                    from .llm import LLMClient
+                    LLMClient(validation)
+                else:
+                    from .cloud_audio import tts_from_options
+                    tts_from_options(validation)
+                    value['profiles'][value['provider']] = {
+                        k:v for k,v in value.items() if k not in ('profiles','provider')}
+                changes[paths[name]] = value
+            if any(key in data for key in ('groups', 'history_enabled', 'daily_clear')):
+                if 'members' not in paths:
+                    raise PanelError('请先在主配置设置 members_config_file')
+                members = read_json(paths['members'])
+                if 'groups' in data:
+                    rooms = data['groups']
+                    if not isinstance(rooms, list) or len(rooms) > 1000:
+                        raise PanelError('群 ID 应为列表，最多 1000 项')
+                    for room in rooms:
+                        validate_target(room)
+                        if not room.endswith('@chatroom'):
+                            raise PanelError('请输入以 @chatroom 结尾的群 ID')
+                    members['groups'] = {room: members.get('groups', {}).get(room, []) for room in dict.fromkeys(rooms)}
+                    if config.get('chat_allowlist'):
+                        config['chat_allowlist'] = list(dict.fromkeys(config['chat_allowlist'] + rooms))
+                for key in ('history_enabled', 'daily_clear'):
+                    if key in data:
+                        if type(data[key]) is not bool:
+                            raise PanelError('记录开关必须为布尔值')
+                        members[key] = data[key]
+                changes[paths['members']] = members
+            if 'natural_chat' in data or 'groups' in data:
+                from .natural_settings import normalize_settings
+                members = changes.get(paths.get('members'))
+                if members is None:
+                    members = read_json(paths['members']) if 'members' in paths else {'groups': {}}
+                previous = config.get('plugins', {}).get('natural_chat', {})
+                supplied = data.get('natural_chat', previous)
+                settings = normalize_settings(supplied, list(members.get('groups', {})),
+                    self.root, prune_unknown='groups' in data and 'natural_chat' not in data)
+                from linux_native.ownership import resolve_owner
+                for room, row in settings['group_settings'].items():
+                    old = previous.get('group_settings', {}).get(room, {})
+                    choices = []
+                    if app is not None and row['owner_wxid'] != old.get('owner_wxid', ''):
+                        session = app.backend.session_id
+                        choices = [{'wxid':item['wxid'], 'name':' '.join((item.get('nickname') or item.get('wechat_name') or item['wxid']).split())[:64]}
+                            for item in (app.service.group_members(room, expected_session=session) or [])]
+                    row.update(resolve_owner(row['owner_wxid'], old, choices, config.get('wechat_account')))
+                config.setdefault('plugins', {})['natural_chat'] = settings
+            changes[self.store.path] = config
+            originals={path:path.read_bytes() if path.exists() else None for path in changes}
+            self._save_many(changes)
+            if app is not None:
+                try:app.apply_runtime_configuration(set(data))
+                except Exception:
+                    for path,raw in originals.items():
+                        if raw is None:path.unlink(missing_ok=True)
+                        else:atomic_json(path,json.loads(raw.decode('utf-8-sig')))
+                    try:app.apply_runtime_configuration(set(data))
+                    except Exception:
+                        raise PanelError('应用失败且运行状态未能恢复，已恢复配置文件；请停止机器人后重试',409) from None
+                    raise PanelError('配置应用失败，已恢复之前的配置',409) from None
+
+    def plugin_action(self, data):
+        name, action = validate_name(data.get('name')), data.get('action')
+        if action not in ('enable', 'disable', 'reload', 'configure'):
+            raise PanelError('不支持的插件操作')
+        if name not in {row['name'] for row in self.plugin_rows()}:
+            raise PanelError('未找到该插件', 404)
+        if action == 'configure' and name == 'natural_chat':
+            return self.save_configuration({'natural_chat': data.get('options')})
+        with self.actions:
+            if action == 'configure':
+                with self.lock, self._editing():
+                    options = data.get('options')
+                    if not isinstance(options, dict) or ('enabled' in options and type(options['enabled']) is not bool):
+                        raise PanelError('插件配置应为 JSON 对象，enabled 应为布尔值')
+                    config = self.store.load()
+                    config.setdefault('plugins', {})[name] = options
+                    self._save_many({self.store.path: config})
+                return
+            with self.lock:
+                running = self.app is not None
+            if running:
+                self._call(lambda app: getattr(app.plugins, action)(name))
+            else:
+                with self.lock, self._editing():
+                    if action == 'reload':
+                        raise PanelError('插件未运行；请先启动机器人', 409)
+                    self.store.set_enabled(name, action == 'enable')
+
+    def chats(self):
+        return self._call(lambda app: app.backend.chats() if app.backend and hasattr(app.backend, 'chats') else [])
+
+    def plugin_editor(self, name):
+        name = validate_name(name)
+        with self.lock:
+            options = self.store.load().get('plugins', {}).get(name, {})
+            result = self.plugin_sources.snapshot(name, options)
+            result['running'] = bool(self.app is not None and self.state != 'stopping')
+            result['active'] = bool(self.app and self.app.plugins.is_active(name))
+            return result
+
+    def plugin_business(self, name):
+        return business_view(self.plugin_editor(name))
+
+    def save_plugin_business(self, data):
+        if data.get('action', 'save') not in ('save', 'reset'):
+            raise PanelError('不支持的业务函数操作')
+        return self.save_plugin_source(data, reset=data.get('action') == 'reset', business=True)
+
+    def save_plugin_source(self, data, *, reset=False, business=False):
+        name = validate_name(data.get('name'))
+        if not isinstance(data.get('revision'), str):
+            raise PanelError('缺少源码版本，请重新打开编辑器', 409)
+        with self.actions:
+            with self.lock:
+                if self.state == 'stopping' or self.stop_event.is_set():
+                    raise PanelError('机器人正在停止，请稍后重试', 409)
+                running = self.app is not None
+            if running:
+                return self._call(lambda app: self._write_plugin_source(name, data, reset=reset, app=app, business=business))
+            with self.lock, self._editing():
+                return self._write_plugin_source(name, data, reset=reset, business=business)
+
+    def _write_plugin_source(self, name, data, *, reset, app=None, business=False):
+        with self.lock:
+            before = self.store.load()
+            sources = self.plugin_sources
+            current = sources.snapshot(name, before.get('plugins', {}).get(name, {}))
+            if data['revision'] != current['revision']:
+                raise PanelError('插件已被其他页面修改，请重新读取后再保存', 409)
+            options = sources.defaults(name) if reset else data.get('options')
+            if not isinstance(options, dict) or ('enabled' in options and type(options['enabled']) is not bool):
+                raise PanelError('插件配置应为 JSON 对象，enabled 应为布尔值')
+            previous = sources.pointer(name)
+            files = merge_business(current['files'], data.get('functions')) if business and not reset else data.get('files')
+            revision = None if reset else sources.prepare(name, files)
+            config = deepcopy(before)
+            config.setdefault('plugins', {})[name] = options
+            try:
+                sources.activate(name, revision)
+                self._save_many({self.store.path: config})
+                if app is not None:
+                    app.plugins.config = config
+                    spec = app.plugins.discover().get(name)
+                    if spec is None:
+                        raise ValueError('插件清单无法加载')
+                    if options.get('enabled', spec.default_enabled):
+                        app.plugins.load_one(name)
+                    else:
+                        app.plugins.disable(name, persist=False)
+            except BaseException as error:
+                sources.activate(name, previous)
+                atomic_json(self.store.path, before)
+                if app is not None:
+                    app.plugins.config = before
+                detail = redact(error) if isinstance(error, Exception) else '插件主动中止加载'
+                raise PanelError('保存未生效，已恢复原版本：' + detail, 400) from None
+            result = self.plugin_editor(name)
+            result['applied'] = bool(app is not None and app.plugins.is_active(name))
+            return business_view(result) if business else result
+
+    def group_members(self, room):
+        from .group_management import validate_group_id
+        room = validate_group_id(room)
+        def query(app):
+            if not app._connection_ready or app.backend is None:
+                raise PanelError('微信尚未连接', 409)
+            session = app.backend.session_id
+            rows = app.service.group_members(room, expected_session=session)
+            if rows is None:
+                raise PanelError('群成员缓存尚未就绪，请在微信打开该群后重试', 409)
+            return {'room': room, 'session_id': session, 'members': list(rows)}
+        return self._call(query)
+
+    def send_status(self, identifier):
+        with self.lock:
+            job = self.send_jobs.get(identifier)
+            if job is None:
+                raise PanelError('发送记录已失效，请查看消息监控确认结果', 404)
+            return {key: job[key] for key in ('request_id', 'status', 'error')}
+
+    def send_text(self, data):
+        """立即返回发送单号，等待节奏和原生回调在独立线程完成，HTTP 不重试发送。"""
+        target = validate_target(data.get('chat_id'))
+        content, mentions = data.get('content'), data.get('at_list', [])
+        identifier, session = data.get('request_id'), data.get('session_id')
+        if not isinstance(identifier, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,80}', identifier):
+            raise PanelError('发送请求编号无效')
+        if not isinstance(session, str) or not session or len(session) > 80:
+            raise PanelError('请先选择会话并刷新连接', 409)
+        if not isinstance(content, str) or not content.strip() or '\0' in content or len(content.encode('utf-8')) > 1023:
+            raise PanelError('正文应为 1–1023 个 UTF-8 字节，不能包含 NUL')
+        if not isinstance(mentions, list):
+            raise PanelError('艾特成员必须为列表')
+        mentions = validate_mentions(target, mentions) if mentions else ()
+        payload = (target, content, mentions, session)
+        with self.lock:
+            previous = self.send_jobs.get(identifier)
+            if previous is not None:
+                if previous['payload'] != payload:
+                    raise PanelError('发送编号已使用，请重新提交', 409)
+                return self.send_status(identifier)
+            if any(job['status'] == 'sending' for job in self.send_jobs.values()):
+                raise PanelError('上一条消息仍在发送，请等待结果', 409)
+            app = self.app
+            if app is None or not app._connection_ready or self.state == 'stopping':
+                raise PanelError('请先启动并连接机器人', 409)
+            if not app.service.session_is_current(session):
+                raise PanelError('微信连接已变化，请重新选择会话', 409)
+            allowed = app.config.get('chat_allowlist', [])
+            if allowed and target not in allowed:
+                raise PanelError('该会话不在收发白名单中')
+            self.send_jobs[identifier] = {'request_id': identifier, 'payload': payload,
+                                          'status': 'sending', 'error': ''}
+            while len(self.send_jobs) > 64:
+                del self.send_jobs[next(iter(self.send_jobs))]
+
+        def deliver():
+            try:
+                if mentions:
+                    rows = app.service.group_members(target, expected_session=session)
+                    if rows is None:
+                        raise ValueError('群成员缓存尚未就绪，请刷新成员后重试')
+                    directory = {row['wxid']: row for row in rows}
+                    if any(member not in directory for member in mentions):
+                        raise ValueError('所选成员已不在群里，请刷新成员后重试')
+                    names = [directory[member].get('nickname') or member for member in mentions]
+                    result = app.service.send_at_text(target, content, mentions,
+                        expected_session=session, display_names=names)
+                else:
+                    result = app.service.send_text(target, content, expected_session=session)
+                if result is False:
+                    raise RuntimeError('微信未确认发送')
+            except Exception:
+                # 不回显异常中的原生路径或请求内容，也不自动重发不确定的结果。
+                with self.lock:
+                    self.send_jobs[identifier].update(status='failed', error='发送未完成，请核对微信和消息监控后再决定是否重发')
+            else:
+                with self.lock:
+                    self.send_jobs[identifier].update(status='sent')
+        threading.Thread(target=deliver, name='PanelTextSend', daemon=True).start()
+        return self.send_status(identifier)
+
+    def send_connection(self):
+        def query(app):
+            if not app._connection_ready or app.backend is None:
+                raise PanelError('微信尚未连接', 409)
+            return {'session_id': app.backend.session_id}
+        return self._call(query)

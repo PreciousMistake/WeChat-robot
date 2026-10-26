@@ -1,0 +1,86 @@
+'use strict';
+const token=document.querySelector('meta[name="helper-token"]').content;
+const $=id=>document.getElementById(id);
+let config=null,catalog=[],dirty=false;
+async function api(path,data){const r=await fetch('/api/'+path,{method:data===undefined?'GET':'POST',headers:{'X-Helper-Token':token,...(data===undefined?{}:{'Content-Type':'application/json'})},body:data===undefined?undefined:JSON.stringify(data)});let value;try{value=await r.json();}catch(e){throw new Error('服务器返回了无法读取的响应，请重试（HTTP '+r.status+'）。');}if(!r.ok)throw new Error(r.status===409?'版本冲突：服务器内容已更新。请保留当前输入，重新读取后合并修改。':value.error||'请求失败');return value;}
+function notice(text,error=false){$('notice').textContent=text;$('notice').classList.toggle('error',error);}
+function node(tag,text,cls){const x=document.createElement(tag);if(text!==undefined)x.textContent=text;if(cls)x.className=cls;return x;}
+function field(title,value,type='text',change){const label=node('label',title),input=node('input');input.type=type;if(type==='checkbox')input.checked=!!value;else input.value=value??'';input.addEventListener('input',()=>{change(type==='checkbox'?input.checked:type==='number'?Number(input.value):input.value);dirty=true;});if(type==='checkbox')label.className='check';label.append(input);return label;}
+function select(title,value,options,change){const label=node('label',title),input=node('select');for(const [key,text]of options){const o=node('option',text);o.value=key;input.append(o);}input.value=value;input.addEventListener('change',()=>{change(input.value);dirty=true;});label.append(input);return label;}
+function ownerOptions(row){const choices=[['','未设置（不认定任何人为主人）'],...(config.owner_members?.[row.id]||[]).map(x=>[x.wxid,`${x.name} · ${x.wxid}`])];if(row.owner_wxid&&!choices.some(x=>x[0]===row.owner_wxid))choices.push([row.owner_wxid,`${row.owner_name||row.owner_wxid}（已绑定，当前成员快照未包含）`]);return choices;}
+function renderGroups(){const parent=$('groups');parent.replaceChildren();for(const row of config.groups){const card=node('div',undefined,'group-card'),head=node('div',undefined,'section-head'),names=node('div');names.append(node('div',row.name||catalog.find(x=>x.id===row.id)?.name||row.id,'group-name'),node('div',row.id,'group-id'));const remove=node('button','移出配置','remove');remove.onclick=()=>{config.groups=config.groups.filter(x=>x!==row);dirty=true;renderGroups();renderCatalog();};head.append(names,remove);const grid=node('div',undefined,'form-grid');grid.append(select('机器人主人',row.owner_wxid||'',ownerOptions(row),v=>row.owner_wxid=v),field('启用这个群',row.enabled!==false,'checkbox',v=>row.enabled=v),field('识别群语音',row.asr_enabled,'checkbox',v=>row.asr_enabled=v),select('人格',row.persona_id||'neutral',[['neutral','无特定人格'],...Object.entries(config.personas).map(([id,p])=>[id,p.name])],v=>row.persona_id=v),select('回复方式',row.reply_mode||'text',[['text','文字'],['auto','随输入方式（语音用语音回复）'],['voice','语音'],['both','文字和语音']],v=>row.reply_mode=v),field('主动接话冷却（秒）',row.cooldown_seconds??30,'number',v=>row.cooldown_seconds=v),field('每小时主动接话上限',row.hourly_limit??30,'number',v=>row.hourly_limit=v));card.append(head,grid,node('p','主人仅按本群真实微信身份绑定，与微信群主、后台权限无关；保存后对新回复生效。成员未显示时，先保存群配置，再刷新群与成员。回复改为文字会取消尚未发送的语音。','muted'));parent.append(card);}if(!config.groups.length)parent.append(node('p','尚未配置群。请从上方选择已加入的群。','muted'));}
+function renderCatalog(){const select=$('catalog');select.replaceChildren();for(const row of catalog.filter(x=>!config.groups.some(g=>g.id===x.id))){const o=node('option',`${row.name} · ${row.id}`);o.value=row.id;select.append(o);}if(!select.options.length){const o=node('option','没有可添加的群，请刷新');o.value='';select.append(o);}}
+function renderPersonas(){const parent=$('personas');parent.replaceChildren();for(const [id,persona]of Object.entries(config.personas)){const card=node('div',undefined,'persona-card'),head=node('div',undefined,'section-head');head.append(field('人格名称',persona.name,'text',v=>{persona.name=v;}));const remove=node('button','移除人格','remove');remove.onclick=()=>{if(config.groups.some(g=>g.persona_id===id)){notice('请先为使用此人格的群选择其他人格。',true);return;}delete config.personas[id];dirty=true;renderPersonas();renderGroups();};head.append(remove);const label=node('label','人格正文'),area=node('textarea');area.rows=7;area.maxLength=20000;area.value=persona.text;area.addEventListener('input',()=>{persona.text=area.value;dirty=true;});label.append(area);const details=node('details'),summary=node('summary','编辑人格正文');details.append(summary,label);card.append(head,details);parent.append(card);}}
+const imageDefaults={enabled:false,protocol:'auto',base_url:'',model:'',size:'1024x1024',timeout_seconds:120,cooldown_seconds:30,hourly_limit:10,extra_body:{}};
+const modelDefaults={max_tokens:1024,timeout_seconds:30,token_limit_parameter:'max_completion_tokens',json_mode:false,extra_body:{}};
+function renderServices(){for(const section of ['model','asr','tts','image']){for(const input of document.querySelectorAll(`[id^="${section}-"]`)){if(!['INPUT','SELECT','TEXTAREA'].includes(input.tagName))continue;const key=input.id.slice(section.length+1);const value=config[section][key]??(section==='model'?modelDefaults[key]:section==='image'?imageDefaults[key]:undefined);if(input.type==='checkbox')input.checked=!!value;else input.value=key==='extra_body'?JSON.stringify(value??{},null,2):value??'';}$(section+'-key-hint').textContent=config[section].api_key_set?'已保存密钥；留空保留原值':'尚未配置密钥';}$('tts-max_chars_per_clip').value=config.tts.max_chars_per_clip??160;$('asr-websocket_url').value=config.asr.websocket_url||'wss://dashscope.aliyuncs.com/api-ws/v1/inference';$('draft_only').checked=config.draft_only;}
+function collect(){for(const section of ['model','asr','tts','image'])for(const input of document.querySelectorAll(`[id^="${section}-"]`)){if(!['INPUT','SELECT','TEXTAREA'].includes(input.tagName))continue;const key=input.id.slice(section.length+1);config[section][key]=input.type==='checkbox'?input.checked:input.type==='number'?Number(input.value):key==='extra_body'?JSON.parse(input.value||'{}'):input.value;}config.draft_only=$('draft_only').checked;return config;}
+async function status(){const data=await api('state');$('state-tag').textContent=data.enabled?(data.draft_only?'只生成草稿':'自动回复已启用'):'回复已暂停';$('pause').textContent=data.enabled?'暂停回复':'启用回复';const values=[[data.groups,'已配置群'],[data.reply_states.draft||0,'待发送草稿'],[data.reply_states.blocked||0,'发送被拦截'],[data.reply_states.uncertain||0,'发送待确认']];$('metrics').replaceChildren(...values.map(([value,label])=>{const card=node('div',undefined,'metric');card.append(node('strong',String(value)),node('span',label));return card;}));const health=$('health');health.replaceChildren();for(const [name,title]of [['receiver_heartbeat','微信接收与发送'],['ai_heartbeat','模型消费者']]){const age=data.heartbeats?.[name]?Math.max(0,Math.floor(Date.now()/1000-data.heartbeats[name])):null;const row=node('div',undefined,'health-row');row.append(node('span',title),node('span',age===null?'等待心跳':age<90?`${age} 秒前活跃`:`心跳已过期（${age} 秒）`));health.append(row);}health.append(node('p',`语音待识别：${data.audio_states.pending||0}　识别失败：${data.audio_states.failed||0}`,'muted'));const images=data.image_states||{};health.append(node('p',`生图待处理：${images.pending||0}　生成中：${images.generating||0}　待发送：${images.forwarded||0}　失败：${images.failed||0}　结果待确认：${images.uncertain||0}`,'muted'));const v=data.voice_states||{};health.append(node('p',`语音待合成：${v.pending||0}　待发送：${v.ready||0}　失败/拦截：${(v.failed||0)+(v.blocked||0)}　待确认：${v.uncertain||0}`,'muted'));}
+async function load(){[config,{chats:catalog}]=await Promise.all([api('config'),api('chats')]);renderGroups();renderCatalog();renderPersonas();renderServices();dirty=false;await status();notice('配置已读取。修改后点击“保存配置”。');}
+document.querySelectorAll('nav button').forEach(button=>button.onclick=()=>{document.querySelectorAll('nav button').forEach(b=>b.classList.toggle('selected',b===button));document.querySelectorAll('[data-section]').forEach(s=>s.hidden=s.dataset.section!==button.dataset.page);$('heading').textContent=button.textContent;$('save').hidden=button.dataset.page==='plugins';if(button.dataset.page==='plugins')refreshPlugins();});
+$('save').onclick=async()=>{const button=$('save');button.disabled=true;try{await api('config',collect());await load();notice('已保存。新任务会使用新配置，无需重启接收连接。');}catch(e){notice(e.message,true);}finally{button.disabled=false;}};
+$('pause').onclick=async()=>{try{const current=await api('state');await api(current.enabled?'stop':'start',{});config.enabled=!current.enabled;await status();notice(current.enabled?'已暂停回复，配置仍可编辑。':'回复已启用。');}catch(e){notice(e.message,true);}};
+$('refresh-groups').onclick=async()=>{try{const [chats,fresh]=await Promise.all([api('chats'),api('config')]);catalog=chats.chats;config.owner_members=fresh.owner_members||{};renderGroups();renderCatalog();notice('群与成员快照已刷新，未保存的修改已保留。');}catch(e){notice(e.message,true);}};
+$('add-group').onclick=()=>{const id=$('catalog').value;if(!id)return;const row=catalog.find(x=>x.id===id);config.groups.push({id,name:row.name,enabled:true,asr_enabled:false,persona_id:'neutral',reply_mode:'text',cooldown_seconds:30,hourly_limit:30});dirty=true;renderGroups();renderCatalog();};
+$('add-persona').onclick=()=>{config.personas['persona_'+Date.now()]={name:'新人格',text:''};dirty=true;renderPersonas();renderGroups();};
+$('tts-provider').onchange=()=>{const fish=$('tts-provider').value==='fish';$('tts-base_url').value=fish?'https://api.fish.audio':'https://api.minimax.cn/v1';$('tts-model').value=fish?'s2.1-pro-free':'speech-2.8-hd';$('tts-default_voice').value=fish?'':'Chinese_sweet_girl_nv1';$('tts-api_key').value='';$('tts-key-hint').textContent='已切换服务商，请填写对应密钥。';dirty=true;};
+document.querySelectorAll('input,textarea,select').forEach(x=>x.addEventListener('input',()=>dirty=true));
+window.addEventListener('beforeunload',event=>{if(dirty||[...pluginEditors.values()].some(editor=>editor.dirty)){event.preventDefault();event.returnValue='';}});
+load().catch(e=>notice(e.message,true));setInterval(()=>status().catch(()=>notice('管理连接暂时中断，未丢弃当前编辑。',true)),5000);
+
+// Plugin state and business drafts have separate lifecycles: polling never replaces inputs.
+const pluginEditors=new Map();
+let pluginRefreshing=false;
+function pluginMessage(editor,text,error=false){editor.feedback.textContent=text;editor.feedback.classList.toggle('error',error);}
+function jsonOptions(text){const value=JSON.parse(text);if(!value||Array.isArray(value)||typeof value!=='object')throw new Error('业务配置必须是 JSON 对象。');return value;}
+function pluginCard(plugin){
+ const card=node('article',undefined,'plugin-card'),head=node('div',undefined,'section-head'),title=node('div');
+ title.append(node('h2',plugin.name),node('p',plugin.description||'暂无说明','muted'));
+ const badge=node('span',undefined,'tag');head.append(title,badge);
+ const state=node('p',undefined,'plugin-state'),capabilities=node('p',undefined,'muted'),failure=node('p',undefined,'plugin-feedback error'),counts=node('p',undefined,'plugin-counts'),actions=node('div',undefined,'plugin-actions');
+ const toggle=node('button'),reload=node('button','重载插件');actions.append(toggle,reload);
+ const details=node('details',undefined,'plugin-editor'),summary=node('summary','业务配置与受限函数'),body=node('div'),feedback=node('p',undefined,'plugin-feedback');feedback.setAttribute('role','status');feedback.setAttribute('aria-live','polite');details.append(summary,body,feedback);
+ const editor={card,badge,state,capabilities,failure,counts,toggle,reload,details,body,feedback,plugin,dirty:false,loaded:false,busy:false,loading:false};
+ pluginEditors.set(plugin.name,editor);
+ async function action(kind){editor.busy=true;updatePlugin(editor,editor.plugin);try{await api('plugin',{name:editor.plugin.name,action:kind});pluginMessage(editor,'操作已生效。');await refreshPlugins();}catch(e){pluginMessage(editor,'操作失败：'+e.message,true);}finally{editor.busy=false;updatePlugin(editor,editor.plugin);}}
+ toggle.onclick=()=>action(editor.plugin.enabled?'disable':'enable');reload.onclick=()=>action('reload');
+ details.addEventListener('toggle',()=>{if(details.open&&!editor.loaded&&!editor.loading)readBusiness(editor);});
+ card.append(head,state,capabilities,failure,counts,actions,details);return editor;
+}
+function updatePlugin(editor,plugin){
+ editor.plugin=plugin;
+ const missing=Array.isArray(plugin.missing_capabilities)?plugin.missing_capabilities:[],managed=!!plugin.managed_by;
+ editor.badge.textContent=managed?'Linux 核心管理':plugin.active?'运行中':plugin.enabled?'已启用 · 未运行':'已停用';
+ editor.state.textContent=managed?'已由 Linux 核心管理（人格 / 自然聊天 / 语音），无需启用第二份。':'配置：'+(plugin.enabled?'启用':'停用')+' · 运行：'+(plugin.active?'活跃':'未活跃');
+ editor.capabilities.textContent=missing.length?'缺少能力：'+missing.join('、'):'当前能力要求已满足';
+ editor.capabilities.classList.toggle('error',missing.length>0);
+ editor.failure.textContent=plugin.error?'运行错误：'+plugin.error:'';
+ editor.counts.textContent='已处理 '+(plugin.handled??0)+' · 错误 '+(plugin.errors??0)+' · 丢弃 '+(plugin.dropped??0);
+ editor.toggle.textContent=plugin.enabled?'停用':'启用';editor.toggle.disabled=editor.busy||managed||(!plugin.enabled&&missing.length>0);
+ editor.toggle.title=managed?'此功能由 Linux 核心管理':missing.length&&!plugin.enabled?'请先提供所缺能力：'+missing.join('、'):'';
+ editor.reload.disabled=editor.busy||managed;
+ editor.details.hidden=managed;
+}
+async function refreshPlugins(){
+ if(pluginRefreshing)return;pluginRefreshing=true;$('refresh-plugins').disabled=true;
+ try{const data=await api('plugins'),plugins=data.plugins||[];for(const plugin of plugins){let editor=pluginEditors.get(plugin.name);if(!editor){editor=pluginCard(plugin);$('plugins').append(editor.card);}updatePlugin(editor,plugin);}
+ for(const [name,editor]of pluginEditors){if(!plugins.some(plugin=>plugin.name===name)){if(editor.dirty){editor.state.textContent='此插件已从运行列表移除；当前未保存输入已保留。';editor.toggle.disabled=true;editor.reload.disabled=true;}else{editor.card.remove();pluginEditors.delete(name);}}}
+ $('plugin-summary').textContent='共 '+plugins.length+' 个插件 · '+plugins.filter(plugin=>plugin.active).length+' 个运行中。状态刷新不会覆盖业务编辑。';$('plugin-summary').classList.remove('error');
+ const runtime=data.runtime||{};$('plugin-runtime').textContent=Object.entries(runtime).filter(([,value])=>typeof value==='boolean'||typeof value==='number').map(([key,value])=>key+'：'+String(value)).join(' · ');
+ }catch(e){$('plugin-summary').textContent='插件状态读取失败：'+e.message+'。当前编辑已保留，可重试。';$('plugin-summary').classList.add('error');}finally{pluginRefreshing=false;$('refresh-plugins').disabled=false;}
+}
+async function readBusiness(editor){
+ editor.loading=true;pluginMessage(editor,'正在读取业务配置…');
+ try{const data=await api('plugin-business?name='+encodeURIComponent(editor.plugin.name));editor.revision=data.revision;editor.body.replaceChildren();
+ const help=node('p','仅编辑此插件公开的业务参数和受限函数。保存后即时生效；恢复默认将替换本插件业务编辑。','muted'),label=node('label','业务参数（JSON）'),options=node('textarea');options.rows=9;options.spellcheck=false;options.className='code-input';options.value=JSON.stringify(data.options||{},null,2);label.append(options);editor.body.append(help,label);editor.options=options;editor.functions=new Map();
+ options.addEventListener('input',()=>{editor.dirty=true;pluginMessage(editor,'有未保存修改。');});
+ for(const [id,code]of Object.entries(data.functions||{})){const functionLabel=node('label',(data.function_labels||{})[id]||id),input=node('textarea');input.rows=12;input.spellcheck=false;input.className='code-input';input.value=code;input.addEventListener('input',()=>{editor.dirty=true;pluginMessage(editor,'有未保存修改。');});functionLabel.append(input);editor.body.append(functionLabel);editor.functions.set(id,input);}
+ if(!editor.functions.size)editor.body.append(node('p','此插件未开放业务函数，可编辑上方业务参数。','muted'));
+ const actions=node('div',undefined,'plugin-actions'),save=node('button','保存并生效','primary'),reset=node('button','恢复默认'),reread=node('button','重新读取服务器版本');actions.append(save,reset,reread);editor.body.append(actions);editor.loaded=true;editor.dirty=false;
+ async function saveBusiness(action){save.disabled=reset.disabled=reread.disabled=true;try{const payload={name:editor.plugin.name,revision:editor.revision,options:action==='save'?jsonOptions(options.value):{},functions:action==='save'?Object.fromEntries([...editor.functions].map(([id,input])=>[id,input.value])):{},action};const result=await api('plugin-business',payload);editor.revision=result.revision??editor.revision;editor.dirty=false;if(action==='reset'){editor.loaded=false;await readBusiness(editor);}pluginMessage(editor,action==='reset'?'已恢复默认并生效。':'业务修改已保存并生效。');await refreshPlugins();}catch(e){pluginMessage(editor,'保存失败：'+e.message,true);}finally{save.disabled=reset.disabled=reread.disabled=false;}}
+ save.onclick=()=>saveBusiness('save');reset.onclick=()=>{if(window.confirm('恢复此插件的默认业务配置和函数？当前编辑将被替换。'))saveBusiness('reset');};reread.onclick=()=>{if(!editor.dirty||window.confirm('重新读取会替换当前未保存输入，是否继续？'))readBusiness(editor);};
+ pluginMessage(editor,'业务配置已读取。');
+ }catch(e){pluginMessage(editor,'读取失败：'+e.message+'。关闭并重新展开可重试。',true);}finally{editor.loading=false;}
+}
+$('refresh-plugins').onclick=refreshPlugins;
+setInterval(()=>{if(!document.querySelector('[data-section="plugins"]').hidden)refreshPlugins();},10000);

@@ -1,0 +1,10 @@
+{
+  "container": "wechat-native-lab",
+  "lab_root": "/opt/wechat-native-lab",
+  "account": "wxid_your_account",
+  "storage": "wxid_your_account_storage",
+  "groups": [],
+  "include_contacts": true,
+  "include_media": true,
+  "run_seconds": 0
+}

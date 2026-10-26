@@ -1,0 +1,12 @@
+{
+  "enabled": false,
+  "protocol": "auto",
+  "base_url": "",
+  "model": "",
+  "api_key": "",
+  "size": "1024x1024",
+  "timeout_seconds": 120,
+  "cooldown_seconds": 30,
+  "hourly_limit": 10,
+  "extra_body": {}
+}

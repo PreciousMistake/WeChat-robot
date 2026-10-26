@@ -1,0 +1,21 @@
+[Unit]
+Description=WeChat native lab AI draft consumer
+After=docker.service wechat-native-receiver.service
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/wechat-native-lab/access
+ExecStart=/usr/bin/python3 -u -m linux_native.ai_supervisor
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=45
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=true
+MemoryMax=128M
+CPUQuota=50%
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

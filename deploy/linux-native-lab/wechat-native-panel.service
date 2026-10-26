@@ -1,0 +1,19 @@
+[Unit]
+Description=WeChat native Linux private administration
+After=network.target
+
+[Service]
+Type=simple
+User=wechatlab
+Group=wechatlab
+WorkingDirectory=/opt/wechat-native-lab/access
+ExecStart=/usr/bin/python3 -u -m linux_native.admin --state /opt/wechat-native-lab/home/.local/share/wechat-access --port 18767
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+MemoryMax=128M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

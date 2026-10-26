@@ -1,0 +1,8 @@
+{
+  "enabled": false,
+  "groups": [],
+  "model": "qwen-audio-3.1-asr-flash-message",
+  "websocket_url": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+  "api_key": "",
+  "timeout_seconds": 45
+}
